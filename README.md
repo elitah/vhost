@@ -20,7 +20,18 @@ vhost(write by golang)
 
 配置文件
 ---
-目前不支持指定配置文件路径，请可执行程序目录下创建config.json，格式如下：
+目前不支持指定配置文件路径，请可执行程序目录下创建config.json，以下为参考配置：
+
+规则如下：
+- 当用户访问`http://example.com`跳转到`https://example.com`，模式为直接HTTP 302跳转
+- 当用户访问`https://example.com`将启动TCP透传模式，将数据发送到127.0.0.1:18880，需要自行提供证书
+- 当用户访问`http://www.example.com`跳转到`https://example.com`，模式为直接HTTP 302跳转
+- 当用户访问`http://autocert.example.com`跳转到`https://autocert.example.com`，模式为直接HTTP 302跳转
+- 当用户访问`https://autocert.example.com`将启动反向代理模式，自动申请证书，将HTTP页面升级到HTTPS
+- 未指定的域名将匹配`*`规则
+
+参数配置文件：
+config.json
 ```
 {
   "http": 80,
@@ -36,11 +47,8 @@ vhost(write by golang)
     "www.example.com": {
       "http_to": "https://example.com"
     },
-    "e1.example.com": {
+    "autocert.example.com": {
       "http_to": "autocert://127.0.0.1:30080"
-    },
-    "e2.example.com": {
-      "http_to": "https://ros.elitah.xyz"
     },
     "*": {
       "http_to": "127.0.0.1:30080",
