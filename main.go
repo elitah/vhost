@@ -404,21 +404,22 @@ func (this *HostList) AddPlugin(domain string, https, autocert, http_up bool, fn
 			}
 		}
 		if https {
-			var target string
+			if autocert {
+				http_up = true
+			}
 			if http_up {
-				target = "https://" + domain
+				this.mListHTTP[domain] = &HTTPRule{
+					AutoCert: autocert,
+					HTTPSUp:  http_up,
+
+					Target: "https://" + domain,
+				}
 			}
 			this.mListHTTPS[domain] = &HTTPSRule{
 				Plugin:        true,
 				PluginHandler: fn,
 
 				AutoCert: autocert,
-			}
-			this.mListHTTP[domain] = &HTTPRule{
-				AutoCert: autocert,
-				HTTPSUp:  http_up,
-
-				Target: target,
 			}
 		} else {
 			this.mListHTTP[domain] = &HTTPRule{
