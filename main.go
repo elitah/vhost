@@ -25,8 +25,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/elitah/vhost/utils/autocert"
-	"github.com/elitah/vhost/utils/logs"
+	"github.com/elitah/utils/autocert"
+	"github.com/elitah/utils/logs"
 
 	"github.com/inconshreveable/go-vhost"
 	"github.com/panjf2000/ants"
