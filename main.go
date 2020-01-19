@@ -61,6 +61,10 @@ func (this *HTTPStat) String() string {
 		this.s_http, this.s_https, this.f_http, this.f_https)
 }
 
+type SuffixRule interface {
+	ChkSuffix(string) bool
+}
+
 type HTTPRule struct {
 	Plugin        bool
 	PluginHandler func(w http.ResponseWriter, r *http.Request)
@@ -69,6 +73,15 @@ type HTTPRule struct {
 	HTTPSUp  bool
 
 	Target string
+
+	Suffix string
+}
+
+func (this *HTTPRule) ChkSuffix(key string) bool {
+	if "" != this.Suffix {
+		return strings.HasSuffix(key, this.Suffix)
+	}
+	return false
 }
 
 type HTTPSRule struct {
@@ -78,6 +91,15 @@ type HTTPSRule struct {
 	AutoCert bool
 
 	Target string
+
+	Suffix string
+}
+
+func (this *HTTPSRule) ChkSuffix(key string) bool {
+	if "" != this.Suffix {
+		return strings.HasSuffix(key, this.Suffix)
+	}
+	return false
 }
 
 type HostList struct {
@@ -85,6 +107,8 @@ type HostList struct {
 
 	ListenHttpPort  int
 	ListenHttpsPort int
+
+	AcceptIP bool
 
 	MasterDomain string
 
@@ -94,6 +118,8 @@ type HostList struct {
 
 	mListHTTP  map[string]*HTTPRule
 	mListHTTPS map[string]*HTTPSRule
+
+	mListSuffix []SuffixRule
 
 	mStat map[string]*HTTPStat
 
@@ -123,6 +149,8 @@ func NewHostList(pool *ants.Pool) *HostList {
 	return &HostList{
 		ListenHttpPort:  80,
 		ListenHttpsPort: 443,
+
+		AcceptIP: false,
 
 		MasterDomain: "",
 
@@ -178,9 +206,11 @@ func (this *HostList) LoadConfig(path string) bool {
 			list := &struct {
 				HTTP     int              `json:"http"`
 				HTTPS    int              `json:"https"`
+				AcceptIP bool             `json:"accept_ip"`
 				Domain   string           `json:"domain"`
 				Username string           `json:"username"`
 				Password string           `json:"password"`
+				Suffix   map[string]*rule `json:"suffix"`
 				List     map[string]*rule `json:"list"`
 			}{}
 			if err := json.Unmarshal(content, list); nil == err {
@@ -193,6 +223,7 @@ func (this *HostList) LoadConfig(path string) bool {
 				if 0 < list.HTTPS && 65536 > list.HTTPS {
 					this.ListenHttpsPort = list.HTTPS
 				}
+				this.AcceptIP = list.AcceptIP
 				if "" != list.Domain {
 					if nil != this.mRegexpDomain && this.mRegexpDomain.MatchString(list.Domain) {
 						// 赋值主域名
@@ -212,8 +243,13 @@ func (this *HostList) LoadConfig(path string) bool {
 						base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", list.Username, list.Password)))))
 				}
 				// 先统计域名
+				for key, _ := range list.Suffix {
+					if "" != key && '.' == key[0] && 4 <= len(key) {
+						domains = append(domains, key)
+					}
+				}
 				for key, _ := range list.List {
-					if "*" != key {
+					if "" != key && "*" != key && 3 <= len(key) {
 						domains = append(domains, key)
 					}
 				}
@@ -223,19 +259,30 @@ func (this *HostList) LoadConfig(path string) bool {
 				domains = append(domains, "*")
 				// 遍历列表并添加规则
 				for _, domain := range domains {
-					if rule, ok := list.List[domain]; ok {
-						if "" != rule.HttpTo {
-							if this.AddHTTP(domain, rule.HttpTo) {
-								logs.Info("AddHTTP: %s => %s Success", domain, rule.HttpTo)
+					var r *rule
+					if '.' == domain[0] {
+						if _r, ok := list.Suffix[domain]; ok {
+							r = _r
+						}
+					}
+					if nil == r {
+						if _r, ok := list.List[domain]; ok {
+							r = _r
+						}
+					}
+					if nil != r {
+						if "" != r.HttpTo {
+							if this.AddHTTP(domain, r.HttpTo) {
+								logs.Info("AddHTTP: %s => %s Success", domain, r.HttpTo)
 							} else {
-								logs.Warn("AddHTTP: %s XX %s Failed", domain, rule.HttpTo)
+								logs.Warn("AddHTTP: %s XX %s Failed", domain, r.HttpTo)
 							}
 						}
-						if "" != rule.HttpsTo {
-							if this.AddHTTPS(domain, rule.HttpsTo) {
-								logs.Info("AddHTTPS: %s => %s Success", domain, rule.HttpsTo)
+						if "" != r.HttpsTo {
+							if this.AddHTTPS(domain, r.HttpsTo) {
+								logs.Info("AddHTTPS: %s => %s Success", domain, r.HttpsTo)
 							} else {
-								logs.Warn("AddHTTPS: %s XX %s Failed", domain, rule.HttpsTo)
+								logs.Warn("AddHTTPS: %s XX %s Failed", domain, r.HttpsTo)
 							}
 						}
 					}
@@ -315,7 +362,7 @@ func (this *HostList) AddHTTP(domain, target string) bool {
 		// 标记
 		var autocert, https_up bool
 		// 正则测试
-		if "*" != domain && nil != this.mRegexpDomain {
+		if '.' != domain[0] && "*" != domain && nil != this.mRegexpDomain {
 			if !this.mRegexpDomain.MatchString(domain) {
 				return false
 			}
@@ -351,9 +398,17 @@ func (this *HostList) AddHTTP(domain, target string) bool {
 			// 根据不同模式创建规则
 			if autocert {
 				if _, ok := this.mListHTTPS[domain]; !ok {
-					this.mListHTTPS[domain] = &HTTPSRule{
-						AutoCert: autocert,
-						Target:   target,
+					if '.' == domain[0] {
+						this.mListHTTPS[domain] = &HTTPSRule{
+							AutoCert: autocert,
+							Target:   target,
+							Suffix:   domain,
+						}
+					} else {
+						this.mListHTTPS[domain] = &HTTPSRule{
+							AutoCert: autocert,
+							Target:   target,
+						}
 					}
 					rule = &HTTPRule{
 						AutoCert: autocert,
@@ -366,6 +421,11 @@ func (this *HostList) AddHTTP(domain, target string) bool {
 			}
 			if nil != rule {
 				rule.Target = target
+				if '.' == domain[0] {
+					rule.Suffix = domain
+					this.mListSuffix = append(this.mListSuffix, rule)
+					return true
+				}
 				this.mListHTTP[domain] = rule
 				return true
 			}
@@ -385,6 +445,21 @@ func (this *HostList) AddHTTPS(domain, target string) bool {
 			if !this.mRegexpIPPort.MatchString(target) {
 				return false
 			}
+		}
+		if '.' == domain[0] {
+			for _, _rule := range this.mListSuffix {
+				if rule, ok := _rule.(*HTTPSRule); ok {
+					if rule.Suffix == domain {
+						rule.Target = target
+						return true
+					}
+				}
+			}
+			this.mListSuffix = append(this.mListSuffix, &HTTPSRule{
+				Target: target,
+				Suffix: domain,
+			})
+			return true
 		}
 		if _, ok := this.mListHTTPS[domain]; !ok {
 			this.mListHTTPS[domain] = &HTTPSRule{
@@ -669,8 +744,19 @@ func (this *HostList) HandleConnHTTP(src *vhost.HTTPConn) error {
 			var rule *HTTPRule
 
 			if rule = this.mListHTTP[key]; nil == rule {
-				if rule = this.mListHTTP["*"]; nil != rule {
-					key = fmt.Sprintf("*(%s)", key)
+				for _, r := range this.mListSuffix {
+					if r.ChkSuffix(key) {
+						var ok bool
+						rule, ok = r.(*HTTPRule)
+						if ok {
+							break
+						}
+					}
+				}
+				if nil == rule {
+					if rule = this.mListHTTP["*"]; nil != rule {
+						key = fmt.Sprintf("*(%s)", key)
+					}
 				}
 			}
 
@@ -716,8 +802,19 @@ func (this *HostList) HandleConnHTTPS(src *vhost.TLSConn, raw net.Conn) (bool, e
 				var rule *HTTPSRule
 
 				if rule = this.mListHTTPS[key]; nil == rule {
-					if rule = this.mListHTTPS["*"]; nil != rule {
-						key = fmt.Sprintf("*(%s)", key)
+					for _, r := range this.mListSuffix {
+						if r.ChkSuffix(key) {
+							var ok bool
+							rule, ok = r.(*HTTPSRule)
+							if ok {
+								break
+							}
+						}
+					}
+					if nil == rule {
+						if rule = this.mListHTTPS["*"]; nil != rule {
+							key = fmt.Sprintf("*(%s)", key)
+						}
 					}
 				}
 
@@ -831,7 +928,11 @@ func (this *HostList) TestDoman(domain string) string {
 	if "" != domain {
 		if nil != this.mRegexpIPAddr {
 			if this.mRegexpIPAddr.MatchString(domain) {
-				return ""
+				if this.AcceptIP {
+					return "*"
+				} else {
+					return ""
+				}
 			}
 		}
 		if nil != this.mRegexpIPPort {
