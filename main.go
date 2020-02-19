@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -26,7 +27,9 @@ import (
 	"time"
 
 	"github.com/elitah/utils/autocert"
+	"github.com/elitah/utils/hash"
 	"github.com/elitah/utils/logs"
+	"github.com/elitah/utils/random"
 
 	"github.com/inconshreveable/go-vhost"
 	"github.com/panjf2000/ants"
@@ -66,7 +69,6 @@ type SuffixRule interface {
 }
 
 type HTTPRule struct {
-	Plugin        bool
 	PluginHandler func(w http.ResponseWriter, r *http.Request)
 
 	AutoCert bool
@@ -85,7 +87,6 @@ func (this *HTTPRule) ChkSuffix(key string) bool {
 }
 
 type HTTPSRule struct {
-	Plugin        bool
 	PluginHandler func(w http.ResponseWriter, r *http.Request)
 
 	AutoCert bool
@@ -93,6 +94,8 @@ type HTTPSRule struct {
 	Target string
 
 	Suffix string
+
+	AuthBase64 string
 }
 
 func (this *HTTPSRule) ChkSuffix(key string) bool {
@@ -100,6 +103,19 @@ func (this *HTTPSRule) ChkSuffix(key string) bool {
 		return strings.HasSuffix(key, this.Suffix)
 	}
 	return false
+}
+
+type AuthNode struct {
+	start int64
+	end   int64
+}
+
+func (this *AuthNode) Available() bool {
+	return 0 == this.start || (0 < this.end && this.end <= time.Now().Unix()) || (this.start+600) <= time.Now().Unix()
+}
+
+func (this *AuthNode) Success() bool {
+	return 0 < this.end && this.end > time.Now().Unix()
 }
 
 type HostList struct {
@@ -127,16 +143,25 @@ type HostList struct {
 
 	mPool *sync.Pool
 
-	mRegexpDomain   *regexp.Regexp
-	mRegexpIPAddr   *regexp.Regexp
-	mRegexpIPPort   *regexp.Regexp
-	mRegexpHttpAuth *regexp.Regexp
+	mCookieSID string
+
+	mRegexpCookie *regexp.Regexp
+	mRegexpDomain *regexp.Regexp
+	mRegexpIPAddr *regexp.Regexp
+	mRegexpIPPort *regexp.Regexp
+
+	mHttpAuth string
 
 	mClient *http.Client
 
 	mAutoCert *autocert.AutoCertManager
 
 	mSSLAddr net.Addr
+
+	mReCAPTCHA       string
+	mReCAPTCHAVerify string
+
+	mAuthCode map[string]*AuthNode
 }
 
 func NewHostList(pool *ants.Pool) *HostList {
@@ -144,6 +169,9 @@ func NewHostList(pool *ants.Pool) *HostList {
 
 	if nil != err {
 		logs.Warn(err)
+	} else {
+		if nil != jar {
+		}
 	}
 
 	return &HostList{
@@ -171,6 +199,9 @@ func NewHostList(pool *ants.Pool) *HostList {
 			},
 		},
 
+		mCookieSID: random.NewRandomString(random.ModeNoLine, 16),
+
+		mRegexpCookie: regexp.MustCompile(`^__auth_token_\d{10}__$`),
 		mRegexpDomain: regexp.MustCompile(`(\w+\.)+\w+`),
 		mRegexpIPAddr: regexp.MustCompile(`(25[0-5]|2[0-4]\d|[0-1]\d{2}|[1-9]?\d)\.(25[0-5]|2[0-4]\d|[0-1]\d{2}|[1-9]?\d)\.(25[0-5]|2[0-4]\d|[0-1]\d{2}|[1-9]?\d)\.(25[0-5]|2[0-4]\d|[0-1]\d{2}|[1-9]?\d)`),
 		mRegexpIPPort: regexp.MustCompile(`^(25[0-5]|2[0-4]\d|[0-1]\d{2}|[1-9]?\d)\.(25[0-5]|2[0-4]\d|[0-1]\d{2}|[1-9]?\d)\.(25[0-5]|2[0-4]\d|[0-1]\d{2}|[1-9]?\d)\.(25[0-5]|2[0-4]\d|[0-1]\d{2}|[1-9]?\d):([0-9]|[1-9]\d{1,3}|[1-5]\d{4}|6[0-4]\d{4}|65[0-4]\d{2}|655[0-2]\d|6553[0-5])$`),
@@ -179,10 +210,12 @@ func NewHostList(pool *ants.Pool) *HostList {
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
-			Jar: jar,
+			//Jar: jar,
 		},
 
 		mAutoCert: autocert.NewAutoCertManager(),
+
+		mAuthCode: make(map[string]*AuthNode),
 	}
 }
 
@@ -204,14 +237,16 @@ func (this *HostList) LoadConfig(path string) bool {
 				HttpsTo string `json:"https_to"`
 			}
 			list := &struct {
-				HTTP     int              `json:"http"`
-				HTTPS    int              `json:"https"`
-				AcceptIP bool             `json:"accept_ip"`
-				Domain   string           `json:"domain"`
-				Username string           `json:"username"`
-				Password string           `json:"password"`
-				Suffix   map[string]*rule `json:"suffix"`
-				List     map[string]*rule `json:"list"`
+				HTTP            int              `json:"http"`
+				HTTPS           int              `json:"https"`
+				AcceptIP        bool             `json:"accept_ip"`
+				ReCAPTCHA       string           `json:"recaptcha"`
+				ReCAPTCHAVerify string           `json:"recaptcha_verify"`
+				Domain          string           `json:"domain"`
+				Username        string           `json:"username"`
+				Password        string           `json:"password"`
+				Suffix          map[string]*rule `json:"suffix"`
+				List            map[string]*rule `json:"list"`
 			}{}
 			if err := json.Unmarshal(content, list); nil == err {
 				// 用于统计域名，方便排序
@@ -224,6 +259,10 @@ func (this *HostList) LoadConfig(path string) bool {
 					this.ListenHttpsPort = list.HTTPS
 				}
 				this.AcceptIP = list.AcceptIP
+				if "" != list.ReCAPTCHA && "" != list.ReCAPTCHAVerify {
+					this.mReCAPTCHA = list.ReCAPTCHA
+					this.mReCAPTCHAVerify = list.ReCAPTCHAVerify
+				}
 				if "" != list.Domain {
 					if nil != this.mRegexpDomain && this.mRegexpDomain.MatchString(list.Domain) {
 						// 赋值主域名
@@ -239,8 +278,7 @@ func (this *HostList) LoadConfig(path string) bool {
 					}
 				}
 				if "" != list.Username && "" != list.Password {
-					this.mRegexpHttpAuth = regexp.MustCompile(fmt.Sprintf(`^(B|b)asic\s+%s$`,
-						base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", list.Username, list.Password)))))
+					this.mHttpAuth = base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", list.Username, list.Password)))
 				}
 				// 先统计域名
 				for key, _ := range list.Suffix {
@@ -361,6 +399,8 @@ func (this *HostList) AddHTTP(domain, target string) bool {
 	if "" != domain && "" != target {
 		// 标记
 		var autocert, https_up bool
+		// 用户名和密码
+		var username, password string
 		// 正则测试
 		if '.' != domain[0] && "*" != domain && nil != this.mRegexpDomain {
 			if !this.mRegexpDomain.MatchString(domain) {
@@ -369,10 +409,23 @@ func (this *HostList) AddHTTP(domain, target string) bool {
 		}
 		// 检查是否是自动证书模式
 		if 11 < len(target) && strings.HasPrefix(target, "autocert://") {
-			// 去除头
-			target = target[11:len(target)]
-			// 标记
-			autocert = true
+			if u, err := url.Parse(target); nil == err {
+				// 获取用户名和密码
+				if nil != u.User {
+					username = u.User.Username()
+					if _password, ok := u.User.Password(); ok {
+						password = _password
+					} else {
+						password = username
+					}
+				}
+				// 获取地址
+				target = u.Host
+				// 标记
+				autocert = true
+			} else {
+				return false
+			}
 			// 检查是否是强制跳转HTTPS模式
 		} else if 8 < len(target) && strings.HasPrefix(target, "https://") {
 			// 标记
@@ -408,6 +461,8 @@ func (this *HostList) AddHTTP(domain, target string) bool {
 						this.mListHTTPS[domain] = &HTTPSRule{
 							AutoCert: autocert,
 							Target:   target,
+
+							AuthBase64: base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password))),
 						}
 					}
 					rule = &HTTPRule{
@@ -491,14 +546,12 @@ func (this *HostList) AddPlugin(domain string, https, autocert, http_up bool, fn
 				}
 			}
 			this.mListHTTPS[domain] = &HTTPSRule{
-				Plugin:        true,
 				PluginHandler: fn,
 
 				AutoCert: autocert,
 			}
 		} else {
 			this.mListHTTP[domain] = &HTTPRule{
-				Plugin:        true,
 				PluginHandler: fn,
 			}
 		}
@@ -558,6 +611,103 @@ func (this *HostList) AddViewStatistics(domain string) {
 	}
 }
 
+func (this *HostList) VerifyReCAPTCHA(token string, r *http.Request) bool {
+	if "" != this.mReCAPTCHA {
+		if "" != token {
+			args := url.Values{}
+			// 校验密钥
+			args.Add("secret", this.mReCAPTCHAVerify)
+			// 结果令牌
+			args.Add("response", token)
+			// 获取IP
+			if address := strings.Split(r.RemoteAddr, ":"); 0 < len(address) {
+				args.Add("remoteip", address[0])
+			}
+			// API查验
+			if resp, err := http.PostForm("https://recaptcha.net/recaptcha/api/siteverify", args); nil == err {
+				defer resp.Body.Close()
+				//
+				if http.StatusOK == resp.StatusCode {
+					var buffer [1024]byte
+					//
+					if n, err := io.ReadFull(resp.Body, buffer[:]); nil == err || io.ErrUnexpectedEOF == err {
+						if 0 < n {
+							var result struct {
+								Success     bool     `json:"success"`
+								ChallengeTS string   `json:"challenge_ts"`
+								Hostname    string   `json:"hostname"`
+								Score       float32  `json:"score"`
+								ErrorCodes  []string `json:"error-codes"`
+							}
+							//
+							if err := json.Unmarshal(buffer[:n], &result); nil == err {
+								if result.Success {
+									if 0.6 <= result.Score {
+										return true
+									} else {
+										logs.Error("result score: %f", result.Score)
+									}
+								} else {
+									logs.Error("result success: false")
+								}
+							} else {
+								logs.Error(err)
+							}
+						} else {
+							logs.Error("read empty")
+						}
+					} else {
+						logs.Error(err)
+					}
+				} else {
+					logs.Error("http error: %d", resp.StatusCode)
+				}
+			} else {
+				logs.Error(err)
+			}
+		}
+		return false
+	}
+	return true
+}
+
+func (this *HostList) IsAuthLogin(w http.ResponseWriter, r *http.Request, domain string, rule *HTTPSRule) bool {
+	if nil != w && nil != r && "" != domain && nil != rule {
+		if "" != rule.AuthBase64 {
+			if list := r.Cookies(); 0 < len(list) {
+				for _, item := range list {
+					if this.mRegexpCookie.MatchString(item.Name) {
+						if "" != item.Value {
+							//
+							hash.SetGobFormat(false)
+							// 比对结果
+							if hash.HashToString("sha1", rule.AuthBase64,
+								item.Name[13:23],
+								this.mCookieSID) == item.Value {
+								// 修改有效期
+								item.Path = "/"
+								item.MaxAge = 1800
+								item.HttpOnly = true
+								// 更新cookie
+								http.SetCookie(w, item)
+								//
+								return true
+							}
+						}
+						// 修改有效期
+						item.MaxAge = -1
+						// 废除cookie
+						http.SetCookie(w, item)
+					}
+				}
+			}
+		} else {
+			return true
+		}
+	}
+	return false
+}
+
 func (this *HostList) SetSSLAddr(addr net.Addr) {
 	this.mSSLAddr = addr
 }
@@ -589,13 +739,66 @@ func (this *HostList) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			this.ServeMaster(w, r)
 			return
 		} else if rule, _ := this.mListHTTPS[r.Host]; nil != rule {
-			if rule.Plugin {
+			if nil != rule.PluginHandler {
 				rule.PluginHandler(w, r)
 				// 退出
 				return
 			} else if rule.AutoCert {
+				if !this.IsAuthLogin(w, r, r.Host, rule) {
+					if "GET" != r.Method {
+						if "HEAD" != r.Method {
+							w.WriteHeader(http.StatusUnauthorized)
+						}
+						return
+					}
+					for i := 0; 1 > i; i++ {
+						if referer := r.Header.Get("Referer"); "" != referer {
+							if u, err := url.Parse(referer); nil == err {
+								if code := u.Query().Get("code"); "" != code {
+									if this.CheckAuthCodeOK(code) {
+										//
+										timeunix := time.Now().Unix()
+										//
+										hash.SetGobFormat(false)
+										//
+										http.SetCookie(w, &http.Cookie{
+											Name: fmt.Sprintf("__auth_token_%d__", timeunix),
+											Value: hash.HashToString("sha1", rule.AuthBase64,
+												timeunix,
+												this.mCookieSID),
+											MaxAge:   1800,
+											HttpOnly: true,
+										})
+										break
+									}
+								}
+							}
+						}
+						if "" != this.MasterDomain {
+							//
+							v := url.Values{}
+							//
+							v.Add("redirect", fmt.Sprintf("https://%s%s", r.Host, r.URL.RequestURI()))
+							//
+							u := url.URL{
+								Scheme:   "https",
+								Host:     this.MasterDomain,
+								Path:     "/login",
+								RawQuery: v.Encode(),
+							}
+							//
+							this.HttpRedirect(w, u.String())
+						} else {
+							w.WriteHeader(http.StatusUnauthorized)
+						}
+						return
+					}
+				}
+				//
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				//
 				defer cancel()
+				//
 				if newReq := r.WithContext(ctx); nil != newReq {
 					newReq.URL.Scheme = "http"
 					newReq.URL.Host = rule.Target
@@ -638,79 +841,501 @@ func (this *HostList) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
-	if this.CheckHTTPAuth(w, r) {
-		var n int
-
-		this.RLock()
-		n = len(this.mStat)
-		this.RUnlock()
-
-		if 0 < n {
-			var i int
-
-			list := make([]string, 0, n)
-
-			fmt.Fprint(w, `<html>`)
-
-			fmt.Fprint(w, `<head>`)
-			fmt.Fprint(w, `<meta charset="UTF-8">`)
-			fmt.Fprint(w, `<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=0">`)
-			fmt.Fprint(w, `<meta http-equiv="Cache-Control" content="no-cache" />`)
-			fmt.Fprint(w, `<meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">`)
-			fmt.Fprint(w, `<style>`)
-			fmt.Fprint(w, `td { text-align: center; }`)
-			fmt.Fprint(w, `.domain { width: 50%; background-color: #F8F8F8; }`)
-			fmt.Fprint(w, `.red { background-color: #FFB5B5; }`)
-			fmt.Fprint(w, `.green { background-color: #CEFFCE; }`)
-			fmt.Fprint(w, `</style>`)
-			fmt.Fprint(w, `</head>`)
+	switch r.URL.Path {
+	case "/":
+		if this.CheckHTTPAuth(w, r) {
+			var n int
 
 			this.RLock()
-
-			fmt.Fprint(w, `<p>最近访问的域名列表: <select>`)
-
-			for e := this.mList.Front(); nil != e; e = e.Next() {
-				i++
-				fmt.Fprintf(w, `<option>%d: %v</option>`, i, e.Value)
-			}
-
-			fmt.Fprint(w, `</select></p>`)
-
+			n = len(this.mStat)
 			this.RUnlock()
 
-			fmt.Fprint(w, `<table border="1" style="width: 60%; border-collapse: collapse;">`)
-			fmt.Fprint(w, `<tr>`)
-			fmt.Fprint(w, `<th class="domain">域名</th>`)
-			fmt.Fprint(w, `<th class="green">HTTP</th>`)
-			fmt.Fprint(w, `<th class="green">HTTPS</th>`)
-			fmt.Fprint(w, `<th class="red">HTTP</th>`)
-			fmt.Fprint(w, `<th class="red">HTTPS</th>`)
-			fmt.Fprint(w, `</tr>`)
+			if 0 < n {
+				var i int
 
-			this.RLock()
+				list := make([]string, 0, n)
 
-			for key, _ := range this.mStat {
-				list = append(list, key)
+				fmt.Fprint(w, `<html>`)
+
+				fmt.Fprint(w, `<head>`)
+				fmt.Fprint(w, `<meta charset="UTF-8">`)
+				fmt.Fprint(w, `<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=0">`)
+				fmt.Fprint(w, `<meta http-equiv="Cache-Control" content="no-cache" />`)
+				fmt.Fprint(w, `<meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">`)
+				fmt.Fprint(w, `<style>`)
+				fmt.Fprint(w, `td { text-align: center; }`)
+				fmt.Fprint(w, `.domain { width: 50%; background-color: #F8F8F8; }`)
+				fmt.Fprint(w, `.red { background-color: #FFB5B5; }`)
+				fmt.Fprint(w, `.green { background-color: #CEFFCE; }`)
+				fmt.Fprint(w, `</style>`)
+				fmt.Fprint(w, `</head>`)
+				fmt.Fprint(w, `<body>`)
+
+				this.RLock()
+
+				fmt.Fprint(w, `<p>最近访问的域名列表: <select>`)
+
+				for e := this.mList.Front(); nil != e; e = e.Next() {
+					i++
+					fmt.Fprintf(w, `<option>%d: %v</option>`, i, e.Value)
+				}
+
+				fmt.Fprint(w, `</select></p>`)
+
+				this.RUnlock()
+
+				fmt.Fprint(w, `<table border="1" style="width: 60%; border-collapse: collapse;">`)
+				fmt.Fprint(w, `<tr>`)
+				fmt.Fprint(w, `<th class="domain">域名</th>`)
+				fmt.Fprint(w, `<th class="green">HTTP</th>`)
+				fmt.Fprint(w, `<th class="green">HTTPS</th>`)
+				fmt.Fprint(w, `<th class="red">HTTP</th>`)
+				fmt.Fprint(w, `<th class="red">HTTPS</th>`)
+				fmt.Fprint(w, `</tr>`)
+
+				this.RLock()
+
+				for key, _ := range this.mStat {
+					list = append(list, key)
+				}
+
+				this.RUnlock()
+
+				sort.Strings(list)
+
+				this.RLock()
+
+				for _, item := range list {
+					if s, ok := this.mStat[item]; ok {
+						fmt.Fprintf(w, `<tr><td class="domain">%s</td>%v</tr>`, item, s)
+					}
+				}
+
+				this.RUnlock()
+
+				fmt.Fprint(w, `</table>`)
+
+				fmt.Fprint(w, `<table border="1" style="margin-top: 2em; width: 60%; border-collapse: collapse;">`)
+				fmt.Fprint(w, `<tr>`)
+				fmt.Fprint(w, `<th class="domain">域名</th>`)
+				fmt.Fprint(w, `<th class="green">插件</th>`)
+				fmt.Fprint(w, `<th class="green">自动证书</th>`)
+				fmt.Fprint(w, `<th class="red">强制HTTPS</th>`)
+				fmt.Fprint(w, `<th class="red">目标</th>`)
+				fmt.Fprint(w, `</tr>`)
+
+				if 0 < len(this.mListHTTP) {
+					var list []string
+					for domain, _ := range this.mListHTTP {
+						if this.MasterDomain != domain {
+							list = append(list, domain)
+						}
+					}
+					sort.Strings(list)
+					for _, item := range list {
+						if rule, ok := this.mListHTTP[item]; ok {
+							fmt.Fprint(w, `<tr>`)
+							fmt.Fprintf(w, `<td>%s</td>`, item)
+							fmt.Fprintf(w, `<td>%v</td>`, nil != rule.PluginHandler)
+							fmt.Fprintf(w, `<td>%v</td>`, rule.AutoCert)
+							fmt.Fprintf(w, `<td>%v</td>`, rule.HTTPSUp)
+							fmt.Fprintf(w, `<td>%s</td>`, rule.Target)
+							fmt.Fprint(w, `</tr>`)
+						}
+					}
+				}
+
+				fmt.Fprint(w, `</table>`)
+
+				fmt.Fprint(w, `<table border="1" style="margin-top: 2em; width: 60%; border-collapse: collapse;">`)
+				fmt.Fprint(w, `<tr>`)
+				fmt.Fprint(w, `<th class="domain">域名</th>`)
+				fmt.Fprint(w, `<th class="green">插件</th>`)
+				fmt.Fprint(w, `<th class="green">自动证书</th>`)
+				fmt.Fprint(w, `<th class="red">目标</th>`)
+				fmt.Fprint(w, `<th class="red">密钥</th>`)
+				fmt.Fprint(w, `</tr>`)
+
+				if 0 < len(this.mListHTTPS) {
+					var list []string
+					//
+					for domain, _ := range this.mListHTTPS {
+						if this.MasterDomain != domain {
+							list = append(list, domain)
+						}
+					}
+					//
+					sort.Strings(list)
+					//
+					for _, item := range list {
+						if rule, ok := this.mListHTTPS[item]; ok {
+							fmt.Fprint(w, `<tr>`)
+							fmt.Fprintf(w, `<td>%s</td>`, item)
+							fmt.Fprintf(w, `<td>%v</td>`, nil != rule.PluginHandler)
+							fmt.Fprintf(w, `<td>%v</td>`, rule.AutoCert)
+							fmt.Fprintf(w, `<td>%s</td>`, rule.Target)
+							//
+							if "" != rule.AuthBase64 {
+								if data, err := base64.StdEncoding.DecodeString(rule.AuthBase64); nil == err {
+									fmt.Fprintf(w, `<td>%s</td>`, string(data))
+								} else {
+									fmt.Fprint(w, `<td></td>`)
+								}
+							} else {
+								fmt.Fprint(w, `<td></td>`)
+							}
+							fmt.Fprint(w, `</tr>`)
+						}
+					}
+				}
+
+				fmt.Fprint(w, `</table>`)
+
+				fmt.Fprint(w, `<table border="1" style="margin-top: 2em; width: 60%; border-collapse: collapse;">`)
+				fmt.Fprint(w, `<tr>`)
+				fmt.Fprint(w, `<th class="domain">域名</th>`)
+				fmt.Fprint(w, `<th class="green">插件</th>`)
+				fmt.Fprint(w, `<th class="green">自动证书</th>`)
+				fmt.Fprint(w, `<th class="red">强制HTTPS</th>`)
+				fmt.Fprint(w, `<th class="red">目标</th>`)
+				fmt.Fprint(w, `<th class="red">前缀</th>`)
+				fmt.Fprint(w, `<th class="red">密钥</th>`)
+				fmt.Fprint(w, `</tr>`)
+
+				for _, rule := range this.mListSuffix {
+					fmt.Fprint(w, `<tr>`)
+					if _rule, ok := rule.(*HTTPRule); ok {
+						fmt.Fprintf(w, `<td>*%s</td>`, _rule.Suffix)
+						fmt.Fprintf(w, `<td>%v</td>`, nil != _rule.PluginHandler)
+						fmt.Fprintf(w, `<td>%v</td>`, _rule.AutoCert)
+						fmt.Fprintf(w, `<td>%v</td>`, _rule.HTTPSUp)
+						fmt.Fprintf(w, `<td>%s</td>`, _rule.Target)
+						fmt.Fprintf(w, `<td>*%s</td>`, _rule.Suffix)
+						fmt.Fprint(w, `<td></td>`)
+					} else if _rule, ok := rule.(*HTTPSRule); ok {
+						fmt.Fprintf(w, `<td>*%s</td>`, _rule.Suffix)
+						fmt.Fprintf(w, `<td>%v</td>`, nil != _rule.PluginHandler)
+						fmt.Fprintf(w, `<td>%v</td>`, _rule.AutoCert)
+						fmt.Fprint(w, `<td></td>`)
+						fmt.Fprintf(w, `<td>%s</td>`, _rule.Target)
+						fmt.Fprintf(w, `<td>*%s</td>`, _rule.Suffix)
+						//
+						if "" != _rule.AuthBase64 {
+							if data, err := base64.StdEncoding.DecodeString(_rule.AuthBase64); nil == err {
+								fmt.Fprintf(w, `<td>%s</td>`, string(data))
+							} else {
+								fmt.Fprint(w, `<td></td>`)
+							}
+						} else {
+							fmt.Fprint(w, `<td></td>`)
+						}
+					}
+					fmt.Fprint(w, `</tr>`)
+				}
+
+				fmt.Fprint(w, `</table>`)
+
+				fmt.Fprint(w, `</body>`)
+				fmt.Fprint(w, `</html>`)
 			}
-
-			this.RUnlock()
-
-			sort.Strings(list)
-
-			this.RLock()
-
-			for _, item := range list {
-				if s, ok := this.mStat[item]; ok {
-					fmt.Fprintf(w, `<tr><td class="domain">%s</td>%v</tr>`, item, s)
+		} else {
+			//
+			v := url.Values{}
+			//
+			v.Add("redirect", fmt.Sprintf("https://%s%s", r.Host, r.URL.RequestURI()))
+			//
+			u := url.URL{
+				Scheme:   "https",
+				Host:     r.Host,
+				Path:     "/login",
+				RawQuery: v.Encode(),
+			}
+			//
+			this.HttpRedirect(w, u.String())
+		}
+		return
+	case "/notice":
+		if errno := r.URL.Query().Get("errno"); "" != errno {
+			var errstr string
+			//
+			switch errno {
+			case "1":
+				errstr = "非法来源，请使用合法的浏览器访问此页"
+			case "2":
+				errstr = "参数错误"
+			case "3":
+				errstr = "找不到此对象"
+			case "4":
+				if redirect := r.URL.Query().Get("redirect"); "" != redirect {
+					//
+					v := url.Values{}
+					//
+					if code := r.URL.Query().Get("code"); "" != code {
+						v.Set("code", code)
+					}
+					v.Set("redirect", redirect)
+					//
+					u := url.URL{
+						Path:     "/login",
+						RawQuery: v.Encode(),
+					}
+					errstr = fmt.Sprintf("用户名或密码错误，<a href=%s>返回</a>", u.String())
+				} else {
+					errstr = "参数错误"
 				}
 			}
-
-			this.RUnlock()
-
-			fmt.Fprint(w, `</table>`)
-			fmt.Fprint(w, `</html>`)
+			//
+			fmt.Fprintf(w, `<html>
+	<head>
+		<meta charset="UTF-8">
+		<title>错误</title>
+		<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=0">
+		<meta http-equiv="Cache-Control" content="no-cache" />
+		<meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+	</head>
+	<body>
+		<p>%s</p>
+	</body>
+</html>
+`, errstr)
+			return
 		}
+		this.HttpError(w, http.StatusBadRequest)
+		return
+	case "/login":
+		if "GET" == r.Method {
+			if redirect := r.URL.Query().Get("redirect"); "" != redirect {
+				if u, err := url.Parse(redirect); nil == err {
+					var code string
+					//
+					if this.MasterDomain != u.Host {
+						code = r.FormValue("code")
+					}
+					if this.MasterDomain == u.Host || this.CheckAuthCode(code) {
+						for i := 0; 1 > i; i++ {
+							if this.MasterDomain == r.Host {
+								break
+							}
+							if rule := this.mListHTTPS[u.Host]; nil != rule {
+								// 判断是否已登录
+								if !this.IsAuthLogin(w, r, u.Host, rule) {
+									break
+								}
+							}
+							this.HttpRedirect(w, redirect)
+							return
+						}
+						fmt.Fprintf(w, `<html>
+	<head>
+		<meta charset="UTF-8">
+		<title>登陆</title>
+		<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=0">
+		<meta http-equiv="Cache-Control" content="no-cache" />
+		<meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+		<script type="text/javascript">
+		function validate_required(field, alerttxt) {
+			with (field) {
+				if (null == value || "" == value) {
+					alert(alerttxt);
+					return false;
+				} else {
+					return true;
+				}
+			}
+			return false;
+		}
+		function validate_form(thisform) {
+			with (thisform) {
+				if (true != validate_required(username, "请输入用户名!")) {
+					username.focus();
+					return false
+				}
+				if (true != validate_required(password, "请输入密码!")) {
+					password.focus();
+					return false
+				}
+			}
+			return true;
+		}
+		</script>
+	</head>
+	<body>
+		<form action="/login" method="POST" onsubmit="return validate_form(this);">
+			<p>
+				<input type="hidden" id="recaptcha" name="recaptcha" />
+				<input type="hidden" name="redirect" value="%s" />
+				<input type="hidden" name="code" value="%s" />
+			</p>
+			<table>
+				<tr>
+					<td>用户名</td>
+					<td><input type="text" name="username" /></td>
+				</tr>
+				<tr>
+					<td>密码</td>
+					<td><input type="password" name="password" /></td>
+				</tr>
+				<tr>
+					<td></td>
+					<td><input type="submit" id="submit" value="请稍候" disabled="disabled" /></td>
+				</tr>
+			</table>
+		</form>
+		`, redirect, code)
+						if "" != this.mReCAPTCHA {
+							fmt.Fprintf(w, `<script src="https://recaptcha.net/recaptcha/api.js?render=%s"></script>
+		<script>
+		grecaptcha.ready(function() {
+			grecaptcha.execute('%s', {action: 'homepage'}).then(function(token) {
+				var btn = document.getElementById("submit");
+				if (btn) {
+					btn.disabled = "";
+					btn.value = "登陆";
+				}
+				document.getElementById("recaptcha").value = token;
+			});
+		});
+		</script>
+`, this.mReCAPTCHA, this.mReCAPTCHA)
+						} else {
+							fmt.Fprintf(w, `<script>
+		var btn = document.getElementById("submit");
+		if (btn) {
+			btn.disabled = "";
+			btn.value = "登陆";
+		}
+		</script>
+	`)
+						}
+						fmt.Fprintf(w, `</body>
+</html>
+`)
+						return
+					} else {
+						// 更新code
+						if code = random.NewRandomString(random.ModeNoLine, 16); "" != code {
+							//
+							result := url.URL{
+								Path: "/login",
+							}
+							//
+							v := url.Values{}
+							//
+							v.Add("redirect", redirect)
+							v.Add("code", code)
+							//
+							result.RawQuery = v.Encode()
+							//
+							this.HttpRedirect(w, result.String())
+							//
+							this.mAuthCode[code] = &AuthNode{
+								start: time.Now().Unix(),
+								end:   0,
+							}
+						} else {
+							this.HttpError(w, http.StatusBadRequest)
+						}
+						return
+					}
+					this.HttpRedirect(w, redirect)
+					return
+				} else {
+					logs.Warn(err)
+				}
+			}
+			this.HttpError(w, http.StatusBadRequest)
+			return
+		} else if "POST" == r.Method {
+			// 错误号
+			var errno int = 0
+			// 跳转地址
+			var redirectCode string
+			var redirectURL string
+			// 机器识别
+			if !this.VerifyReCAPTCHA(r.FormValue("recaptcha"), r) {
+				// 恶意用户
+				errno = 1
+			} else {
+				if redirect := r.FormValue("redirect"); "" != redirect {
+					if u, err := url.Parse(redirect); nil == err {
+						if this.MasterDomain != u.Host {
+							redirectCode = r.FormValue("code")
+						}
+						if this.MasterDomain == u.Host || "" != redirectCode {
+							var validKey string
+							//
+							redirectURL = redirect
+							//
+							if this.MasterDomain == u.Host {
+								validKey = this.mHttpAuth
+							} else if rule := this.mListHTTPS[u.Host]; nil != rule {
+								validKey = rule.AuthBase64
+							}
+							if "" != validKey {
+								//
+								if username := r.FormValue("username"); "" != username {
+									if password := r.FormValue("password"); "" != password {
+										if base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password))) == validKey {
+											if this.MasterDomain == u.Host {
+												http.SetCookie(w, &http.Cookie{
+													Name:     "__auth_token__",
+													Value:    hash.HashToString("sha1", validKey, this.mCookieSID),
+													MaxAge:   1800,
+													HttpOnly: true,
+												})
+											} else {
+												//激活令牌
+												this.SetAuthCodeConfirm(redirectCode)
+											}
+											//跳转
+											this.HttpRedirect(w, redirect)
+											//返回
+											return
+										}
+									}
+								}
+								// 用户名或密码错误
+								errno = 4
+							} else {
+								// 找不到对象
+								errno = 3
+							}
+						} else {
+							errno = 2
+						}
+					} else {
+						errno = 2
+					}
+				} else {
+					errno = 2
+				}
+			}
+			//
+			v := url.Values{}
+			//
+			v.Set("errno", fmt.Sprint(errno))
+			//
+			if "" != redirectCode {
+				v.Set("code", redirectCode)
+			}
+			//
+			v.Set("redirect", redirectURL)
+			//
+			result := &url.URL{
+				Path:     "/notice",
+				RawQuery: v.Encode(),
+			}
+			//
+			this.HttpRedirect(w, result.String())
+			//
+			return
+		} else if "HEAD" == r.Method {
+			return
+		}
+		this.HttpError(w, http.StatusMethodNotAllowed)
+		return
 	}
+	this.HttpError(w, http.StatusNotFound)
 }
 
 func (this *HostList) HandleConn(conn net.Conn, https bool) (bool, error) {
@@ -769,10 +1394,12 @@ func (this *HostList) HandleConnHTTP(src *vhost.HTTPConn) error {
 				} else if rule.HTTPSUp {
 					// HTTP 转 HTTPS
 					this.HttpRedirect(src, rule.Target+src.Request.URL.RequestURI())
-				} else if rule.Plugin {
-					// 插件模式
+				} else if nil != rule.PluginHandler {
+					// 创建输出器
 					w := autocert.NewRedirectWriter()
+					// 插件模式
 					rule.PluginHandler(w, src.Request)
+					// 输出结果
 					w.Flush(src)
 				} else {
 					// TCP透传
@@ -907,19 +1534,65 @@ func (this *HostList) GetVHostConn(conn net.Conn, https bool) (vhost.Conn, error
 	}
 }
 
+func (this *HostList) CheckAuthCode(code string) bool {
+	if _, ok := this.mAuthCode[code]; ok {
+		return true
+	}
+	return false
+}
+
+func (this *HostList) CheckAuthCodeOK(code string) bool {
+	if node, ok := this.mAuthCode[code]; ok {
+		defer func() {
+			//
+			delete(this.mAuthCode, code)
+			//
+			for key, value := range this.mAuthCode {
+				if !value.Available() {
+					delete(this.mAuthCode, key)
+				}
+			}
+		}()
+		//
+		return node.Success()
+	}
+	return false
+}
+
+func (this *HostList) SetAuthCodeConfirm(code string) {
+	if n, ok := this.mAuthCode[code]; ok {
+		n.end = time.Now().Unix() + 180
+	}
+}
+
 func (this *HostList) CheckHTTPAuth(w http.ResponseWriter, r *http.Request) bool {
-	if nil == this.mRegexpHttpAuth {
+	if "" == this.mHttpAuth {
 		return true
 	}
 
-	if nil != r && this.mRegexpHttpAuth.MatchString(r.Header.Get("Authorization")) {
-		return true
+	if cookie, err := r.Cookie("__auth_token__"); nil == err {
+		if hash.HashToString("sha1", this.mHttpAuth, this.mCookieSID) == cookie.Value {
+			//
+			cookie.Path = "/"
+			cookie.MaxAge = 1800
+			cookie.HttpOnly = true
+			// 更新cookie
+			http.SetCookie(w, cookie)
+			//
+			return true
+		}
 	}
 
-	if nil != w {
-		w.Header().Set("WWW-Authenticate", `Basic realm="Need authorization!"`)
-		w.WriteHeader(http.StatusUnauthorized)
-	}
+	/*
+		if nil != r && this.mRegexpHttpAuth.MatchString(r.Header.Get("Authorization")) {
+			return true
+		}
+
+		if nil != w {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Need authorization!"`)
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	*/
 
 	return false
 }
