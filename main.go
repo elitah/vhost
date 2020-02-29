@@ -458,12 +458,17 @@ func (this *HostList) AddHTTP(domain, target string) bool {
 							Suffix:   domain,
 						}
 					} else {
-						this.mListHTTPS[domain] = &HTTPSRule{
+						// 先创建
+						_rule := &HTTPSRule{
 							AutoCert: autocert,
 							Target:   target,
-
-							AuthBase64: base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password))),
 						}
+						// 填写用户名和密码
+						if "" != username && "" != password {
+							_rule.AuthBase64 = base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
+						}
+						// 储存
+						this.mListHTTPS[domain] = _rule
 					}
 					rule = &HTTPRule{
 						AutoCert: autocert,
