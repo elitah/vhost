@@ -96,6 +96,8 @@ type HTTPSRule struct {
 	Suffix string
 
 	AuthBase64 string
+
+	AnonymousDir []string
 }
 
 func (this *HTTPSRule) ChkSuffix(key string) bool {
@@ -233,8 +235,9 @@ func (this *HostList) LoadConfig(path string) bool {
 	if "" != path {
 		if content, err := ioutil.ReadFile(path); nil == err {
 			type rule struct {
-				HttpTo  string `json:"http_to"`
-				HttpsTo string `json:"https_to"`
+				HttpTo       string   `json:"http_to"`
+				HttpsTo      string   `json:"https_to"`
+				AnonymousDir []string `json:"anonymous_dir"`
 			}
 			list := &struct {
 				HTTP            int              `json:"http"`
@@ -310,7 +313,7 @@ func (this *HostList) LoadConfig(path string) bool {
 					}
 					if nil != r {
 						if "" != r.HttpTo {
-							if this.AddHTTP(domain, r.HttpTo) {
+							if this.AddHTTP(domain, r.HttpTo, r.AnonymousDir) {
 								logs.Info("AddHTTP: %s => %s Success", domain, r.HttpTo)
 							} else {
 								logs.Warn("AddHTTP: %s XX %s Failed", domain, r.HttpTo)
@@ -395,7 +398,7 @@ func (this *HostList) LoadPlugin(fullpath string) string {
 	return ""
 }
 
-func (this *HostList) AddHTTP(domain, target string) bool {
+func (this *HostList) AddHTTP(domain, target string, anonymous_dir []string) bool {
 	if "" != domain && "" != target {
 		// 标记
 		var autocert, https_up bool
@@ -466,6 +469,9 @@ func (this *HostList) AddHTTP(domain, target string) bool {
 						// 填写用户名和密码
 						if "" != username && "" != password {
 							_rule.AuthBase64 = base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
+						}
+						if 0 < len(anonymous_dir) {
+							_rule.AnonymousDir = anonymous_dir
 						}
 						// 储存
 						this.mListHTTPS[domain] = _rule
@@ -679,6 +685,11 @@ func (this *HostList) VerifyReCAPTCHA(token string, r *http.Request) bool {
 func (this *HostList) IsAuthLogin(w http.ResponseWriter, r *http.Request, domain string, rule *HTTPSRule) bool {
 	if nil != w && nil != r && "" != domain && nil != rule {
 		if "" != rule.AuthBase64 {
+			for _, item := range rule.AnonymousDir {
+				if strings.HasPrefix(r.URL.Path, item) {
+					return true
+				}
+			}
 			if list := r.Cookies(); 0 < len(list) {
 				for _, item := range list {
 					if this.mRegexpCookie.MatchString(item.Name) {
