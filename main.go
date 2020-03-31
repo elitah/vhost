@@ -1070,6 +1070,45 @@ func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
 			this.HttpRedirect(w, u.String())
 		}
 		return
+	case "/header":
+		//
+		fmt.Fprintf(w, "Method: %s\r\n", r.Method)
+		//
+		if nil != r.URL {
+			fmt.Fprintf(w, "Method: %s\r\n", r.URL.String())
+		}
+		//
+		fmt.Fprintf(w, "Proto: %s, %d, %d\r\n", r.Proto, r.ProtoMajor, r.ProtoMinor)
+		//
+		fmt.Fprintf(w, "ContentLength: %d\r\n", r.ContentLength)
+		//
+		fmt.Fprintf(w, "TransferEncoding: %s\r\n", strings.Join(r.TransferEncoding, ", "))
+		//
+		fmt.Fprintf(w, "Close: %v\r\n", r.Close)
+		//
+		fmt.Fprintf(w, "Host: %s\r\n", r.Host)
+		//
+		fmt.Fprintf(w, "Form: %v\r\n", r.Form)
+		//
+		fmt.Fprintf(w, "PostForm: %v\r\n", r.PostForm)
+		//
+		fmt.Fprintf(w, "RemoteAddr: %s\r\n", r.RemoteAddr)
+		//
+		fmt.Fprintf(w, "RequestURI: %s\r\n", r.RequestURI)
+		//
+		fmt.Fprint(w, "=== Trailer ==================================\r\n")
+		//
+		for key, value := range r.Trailer {
+			fmt.Fprintf(w, "%s: %v\r\n", key, strings.Join(value, ", "))
+		}
+		//
+		fmt.Fprint(w, "=== Header ==================================\r\n")
+		//
+		for key, value := range r.Header {
+			fmt.Fprintf(w, "%s: %v\r\n", key, strings.Join(value, ", "))
+		}
+		//
+		return
 	case "/notice":
 		if errno := r.URL.Query().Get("errno"); "" != errno {
 			var errstr string
