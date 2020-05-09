@@ -1795,6 +1795,14 @@ func main() {
 
 	hostList.LoadConfig("")
 
+	if 0 < hostList.ListenHttpPort {
+		portHttp = hostList.ListenHttpPort
+	}
+
+	if 0 < hostList.ListenHttpsPort {
+		portHttps = hostList.ListenHttpsPort
+	}
+
 	// 创建http监听
 	l_http, err := net.Listen("tcp", fmt.Sprintf(":%d", portHttp))
 
