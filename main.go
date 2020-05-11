@@ -145,7 +145,8 @@ type HostList struct {
 
 	mPool *sync.Pool
 
-	mCookieSID string
+	mCookieSID      string
+	mCookieValidity int
 
 	mRegexpCookie *regexp.Regexp
 	mRegexpDomain *regexp.Regexp
@@ -201,7 +202,8 @@ func NewHostList(pool *ants.Pool) *HostList {
 			},
 		},
 
-		mCookieSID: random.NewRandomString(random.ModeNoLine, 16),
+		mCookieSID:      random.NewRandomString(random.ModeNoLine, 16),
+		mCookieValidity: 1800,
 
 		mRegexpCookie: regexp.MustCompile(`^__auth_token_\d{10}__$`),
 		mRegexpDomain: regexp.MustCompile(`(\w+\.)+\w+`),
@@ -261,7 +263,13 @@ func (this *HostList) LoadConfig(path string) bool {
 				if 0 < list.HTTPS && 65536 > list.HTTPS {
 					this.ListenHttpsPort = list.HTTPS
 				}
+				// 接受IP访问
 				this.AcceptIP = list.AcceptIP
+				// Cookie超时
+				if this.mCookieValidity < list.CookieValidity {
+					this.mCookieValidity = list.CookieValidity
+				}
+				// reCaptcha v3 api key
 				if "" != list.ReCAPTCHA && "" != list.ReCAPTCHAVerify {
 					this.mReCAPTCHA = list.ReCAPTCHA
 					this.mReCAPTCHAVerify = list.ReCAPTCHAVerify
@@ -702,7 +710,7 @@ func (this *HostList) IsAuthLogin(w http.ResponseWriter, r *http.Request, domain
 								this.mCookieSID) == item.Value {
 								// 修改有效期
 								item.Path = "/"
-								item.MaxAge = 1800
+								item.MaxAge = this.mCookieValidity
 								item.HttpOnly = true
 								// 更新cookie
 								http.SetCookie(w, item)
@@ -782,9 +790,10 @@ func (this *HostList) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 											Value: hash.HashToString("sha1", rule.AuthBase64,
 												timeunix,
 												this.mCookieSID),
-											MaxAge:   1800,
+											MaxAge:   this.mCookieValidity,
 											HttpOnly: true,
 										})
+										//
 										break
 									}
 								}
@@ -1335,7 +1344,7 @@ func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
 												http.SetCookie(w, &http.Cookie{
 													Name:     "__auth_token__",
 													Value:    hash.HashToString("sha1", validKey, this.mCookieSID),
-													MaxAge:   1800,
+													MaxAge:   this.mCookieValidity,
 													HttpOnly: true,
 												})
 											} else {
@@ -1629,7 +1638,7 @@ func (this *HostList) CheckHTTPAuth(w http.ResponseWriter, r *http.Request) bool
 		if hash.HashToString("sha1", this.mHttpAuth, this.mCookieSID) == cookie.Value {
 			//
 			cookie.Path = "/"
-			cookie.MaxAge = 1800
+			cookie.MaxAge = this.mCookieValidity
 			cookie.HttpOnly = true
 			// 更新cookie
 			http.SetCookie(w, cookie)
