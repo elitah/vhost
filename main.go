@@ -2,7 +2,6 @@ package main
 
 import (
 	"container/list"
-	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -26,13 +25,19 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/elitah/fast-io"
 	"github.com/elitah/utils/autocert"
+	"github.com/elitah/utils/exepath"
 	"github.com/elitah/utils/hash"
 	"github.com/elitah/utils/logs"
 	"github.com/elitah/utils/random"
 
 	"github.com/inconshreveable/go-vhost"
 	"github.com/panjf2000/ants"
+)
+
+var (
+	rootDir = exepath.GetExeDir()
 )
 
 type HTTPStat struct {
@@ -164,6 +169,9 @@ type HostList struct {
 	mReCAPTCHA       string
 	mReCAPTCHAVerify string
 
+	mGlobalCertFilepath string
+	mGlobalKeyFilepath  string
+
 	mAuthCode map[string]*AuthNode
 }
 
@@ -217,8 +225,6 @@ func NewHostList(pool *ants.Pool) *HostList {
 			//Jar: jar,
 		},
 
-		mAutoCert: autocert.NewAutoCertManager(),
-
 		mAuthCode: make(map[string]*AuthNode),
 	}
 }
@@ -242,16 +248,19 @@ func (this *HostList) LoadConfig(path string) bool {
 				AnonymousDir []string `json:"anonymous_dir"`
 			}
 			list := &struct {
-				HTTP            int              `json:"http"`
-				HTTPS           int              `json:"https"`
-				AcceptIP        bool             `json:"accept_ip"`
-				ReCAPTCHA       string           `json:"recaptcha"`
-				ReCAPTCHAVerify string           `json:"recaptcha_verify"`
-				Domain          string           `json:"domain"`
-				Username        string           `json:"username"`
-				Password        string           `json:"password"`
-				Suffix          map[string]*rule `json:"suffix"`
-				List            map[string]*rule `json:"list"`
+				HTTP               int              `json:"http"`
+				HTTPS              int              `json:"https"`
+				AcceptIP           bool             `json:"accept_ip"`
+				CookieValidity     int              `json:"cookie_validity"`
+				ReCAPTCHA          string           `json:"recaptcha"`
+				ReCAPTCHAVerify    string           `json:"recaptcha_verify"`
+				GlobalCertFilepath string           `json:"global_cert_filepath"`
+				GlobalKeyFilepath  string           `json:"global_key_filepath"`
+				Domain             string           `json:"domain"`
+				Username           string           `json:"username"`
+				Password           string           `json:"password"`
+				Suffix             map[string]*rule `json:"suffix"`
+				List               map[string]*rule `json:"list"`
 			}{}
 			if err := json.Unmarshal(content, list); nil == err {
 				// 用于统计域名，方便排序
@@ -274,6 +283,11 @@ func (this *HostList) LoadConfig(path string) bool {
 					this.mReCAPTCHA = list.ReCAPTCHA
 					this.mReCAPTCHAVerify = list.ReCAPTCHAVerify
 				}
+				// cert chain
+				if "" != list.GlobalCertFilepath && "" != list.GlobalKeyFilepath {
+					this.mGlobalCertFilepath = list.GlobalCertFilepath
+					this.mGlobalKeyFilepath = list.GlobalKeyFilepath
+				}
 				if "" != list.Domain {
 					if nil != this.mRegexpDomain && this.mRegexpDomain.MatchString(list.Domain) {
 						// 赋值主域名
@@ -281,10 +295,12 @@ func (this *HostList) LoadConfig(path string) bool {
 						// 存入列表
 						this.mListHTTP[list.Domain] = &HTTPRule{
 							AutoCert: true,
+							Target:   list.Domain,
 						}
 						// 存入列表
 						this.mListHTTPS[list.Domain] = &HTTPSRule{
 							AutoCert: true,
+							Target:   list.Domain,
 						}
 					}
 				}
@@ -737,6 +753,46 @@ func (this *HostList) SetSSLAddr(addr net.Addr) {
 }
 
 func (this *HostList) TLSConfig() *tls.Config {
+	if "" != this.mGlobalCertFilepath && "" != this.mGlobalKeyFilepath {
+		if f, err := os.Open(this.mGlobalCertFilepath); nil == err {
+			if path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd())); nil == err {
+				this.mGlobalCertFilepath = path
+			}
+			f.Close()
+		} else {
+			this.mGlobalCertFilepath = filepath.Join(rootDir, filepath.Base(this.mGlobalCertFilepath))
+		}
+		if f, err := os.Open(this.mGlobalKeyFilepath); nil == err {
+			if path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd())); nil == err {
+				this.mGlobalKeyFilepath = path
+			}
+			f.Close()
+		} else {
+			this.mGlobalKeyFilepath = filepath.Join(rootDir, filepath.Base(this.mGlobalKeyFilepath))
+		}
+		//
+		logs.Info(this.mGlobalCertFilepath)
+		logs.Info(this.mGlobalKeyFilepath)
+		//
+		if certPem, err := ioutil.ReadFile(this.mGlobalCertFilepath); nil == err {
+			if keyPem, err := ioutil.ReadFile(this.mGlobalKeyFilepath); nil == err {
+				if cert, err := tls.X509KeyPair(certPem, keyPem); nil == err {
+					return &tls.Config{
+						Certificates: []tls.Certificate{cert},
+					}
+				} else {
+					logs.Error(err)
+				}
+			} else {
+				logs.Error(err)
+			}
+		} else {
+			logs.Error(err)
+		}
+	}
+	if nil == this.mAutoCert {
+		this.mAutoCert = autocert.NewAutoCertManager()
+	}
 	return this.mAutoCert.TLSConfig()
 }
 
@@ -769,13 +825,7 @@ func (this *HostList) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			} else if rule.AutoCert {
 				if !this.IsAuthLogin(w, r, r.Host, rule) {
-					if "GET" != r.Method {
-						if "HEAD" != r.Method {
-							w.WriteHeader(http.StatusUnauthorized)
-						}
-						return
-					}
-					for i := 0; 1 > i; i++ {
+					if "GET" == r.Method {
 						if referer := r.Header.Get("Referer"); "" != referer {
 							if u, err := url.Parse(referer); nil == err {
 								if code := u.Query().Get("code"); "" != code {
@@ -794,7 +844,9 @@ func (this *HostList) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 											HttpOnly: true,
 										})
 										//
-										break
+										this.HttpRedirect(w, r.URL.RequestURI())
+										//
+										return
 									}
 								}
 							}
@@ -813,53 +865,55 @@ func (this *HostList) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 							}
 							//
 							this.HttpRedirect(w, u.String())
-						} else {
-							w.WriteHeader(http.StatusUnauthorized)
+							//
+							return
 						}
-						return
 					}
+					//
+					w.WriteHeader(http.StatusUnauthorized)
+					//
+					return
 				}
-				//
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				//
-				defer cancel()
-				//
-				if newReq := r.WithContext(ctx); nil != newReq {
-					newReq.URL.Scheme = "http"
-					newReq.URL.Host = rule.Target
-					newReq.RequestURI = ""
-					newReq.TLS = nil
-					if resp, err := this.mClient.Do(newReq); nil == err {
-						// 回写http头
-						for key, value := range resp.Header {
-							for _, v := range value {
-								w.Header().Add(key, v)
-							}
+				if hj, ok := w.(http.Hijacker); ok {
+					// 得到原始连接
+					if conn_remote, _, err := hj.Hijack(); nil == err {
+						// 退出时关闭
+						defer conn_remote.Close()
+						// 连接目标
+						if conn_local, err := net.DialTimeout("tcp", rule.Target, 30*time.Second); nil == err {
+							// 退出时关闭
+							defer conn_local.Close()
+							// 修改请求
+							r.URL.Scheme = "http"
+							r.TLS = nil
+							// 写请求
+							r.Write(conn_local)
+							//
+							fast_io.FastCopy(conn_remote, conn_local)
+							//
+							return
+						} else {
+							// 输出错误
+							logs.Warn(err)
 						}
-						// 回写HTTP状态
-						w.WriteHeader(resp.StatusCode)
-						// 回写body
-						io.Copy(w, resp.Body)
-						// 关闭body
-						resp.Body.Close()
-						// 退出
-						return
 					} else {
 						// 输出错误
 						logs.Warn(err)
-						// HTTP响应，转发请求失败
-						this.HttpError(w, http.StatusBadGateway)
-						// 退出
-						return
 					}
+				} else {
+					// 输出错误
+					logs.Warn("unable to hijack connection")
 				}
 			}
-		} else {
-			// HTTP响应，未找到
-			this.HttpError(w, http.StatusNotFound)
+			// HTTP响应，转发请求失败
+			this.HttpError(w, http.StatusBadGateway)
 			// 退出
 			return
 		}
+		// HTTP响应，未找到
+		this.HttpError(w, http.StatusNotFound)
+		// 退出
+		return
 	}
 	// HTTP响应，内部服务错误
 	this.HttpError(w, http.StatusInternalServerError)
@@ -1339,7 +1393,8 @@ func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
 								//
 								if username := r.FormValue("username"); "" != username {
 									if password := r.FormValue("password"); "" != password {
-										if base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password))) == validKey {
+										result := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
+										if result == validKey {
 											if this.MasterDomain == u.Host {
 												http.SetCookie(w, &http.Cookie{
 													Name:     "__auth_token__",
@@ -1355,8 +1410,14 @@ func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
 											this.HttpRedirect(w, redirect)
 											//返回
 											return
+										} else {
+											logs.Error("%s:%s => %s => %s", username, password, result, validKey)
 										}
+									} else {
+										logs.Error("no password")
 									}
+								} else {
+									logs.Error("no username")
 								}
 								// 用户名或密码错误
 								errno = 4
@@ -1405,6 +1466,9 @@ func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
 func (this *HostList) HandleConn(conn net.Conn, https bool) (bool, error) {
 	if vconn, err := this.GetVHostConn(conn, https); nil == err {
 		this.AddViewStatistics(vconn.Host())
+		//
+		logs.Info("host: %s, https: %v", vconn.Host(), https)
+		//
 		switch _vconn := vconn.(type) {
 		case *vhost.HTTPConn:
 			defer vconn.Close()
@@ -1453,8 +1517,13 @@ func (this *HostList) HandleConnHTTP(src *vhost.HTTPConn) error {
 				this.AddAttach(key, false)
 
 				if rule.AutoCert {
-					// 提交到自动证书模块
-					this.mAutoCert.ServeRequest(src, src.Request)
+					if nil != this.mAutoCert {
+						// 提交到自动证书模块
+						this.mAutoCert.ServeRequest(src, src.Request)
+					} else {
+						// HTTP 转 HTTPS
+						this.HttpRedirect(src, fmt.Sprintf("https://%s%s", rule.Target, src.Request.URL.RequestURI()))
+					}
 				} else if rule.HTTPSUp {
 					// HTTP 转 HTTPS
 					this.HttpRedirect(src, rule.Target+src.Request.URL.RequestURI())
@@ -1674,8 +1743,14 @@ func (this *HostList) TestDoman(domain string) string {
 		}
 		if nil != this.mRegexpIPPort {
 			if this.mRegexpIPPort.MatchString(domain) {
-				return ""
+				//
+				domain, _, _ = net.SplitHostPort(domain)
+				//
+				return domain
 			}
+		}
+		if _domain := strings.SplitN(domain, ":", 2); 2 <= len(_domain) {
+			return _domain[0]
 		}
 	}
 	return domain
@@ -1804,11 +1879,11 @@ func main() {
 
 	hostList.LoadConfig("")
 
-	if 0 < hostList.ListenHttpPort {
+	if 0 < hostList.ListenHttpPort && portHttp != hostList.ListenHttpPort {
 		portHttp = hostList.ListenHttpPort
 	}
 
-	if 0 < hostList.ListenHttpsPort {
+	if 0 < hostList.ListenHttpsPort && portHttps != hostList.ListenHttpsPort {
 		portHttps = hostList.ListenHttpsPort
 	}
 
