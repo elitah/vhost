@@ -1660,30 +1660,11 @@ func (this *HostList) HandleConnHTTPS(src *vhost.TLSConn, raw net.Conn) (bool, e
 }
 
 func (this *HostList) HandleConnGo(src vhost.Conn, target string) {
-	_, https := src.(*vhost.TLSConn)
-
 	if dst, err := net.DialTimeout("tcp", target, 30*time.Second); nil == err {
-		//logs.Info(src.RemoteAddr(), src.LocalAddr(), dst.RemoteAddr(), dst.LocalAddr())
-
-		exit := make(chan byte)
-
-		// 从客户端复制到服务端
-		if err = this.mAntsPool.Submit(func() {
-			this.Copy(dst, src)
-
-			exit <- 1
-		}); nil == err {
-			// 从服务端复制到客户端
-			this.Copy(src, dst)
-
-			<-exit
-		} else {
-			src.Close()
-			dst.Close()
-		}
-
-		close(exit)
+		fast_io.FastCopy(src, dst)
 	} else {
+		_, https := src.(*vhost.TLSConn)
+
 		logs.Warn("Dial: %v, HTTPS: %v, From %s => %s => %s", err, https, src.RemoteAddr(), src.LocalAddr(), target)
 
 		this.HttpError(src, http.StatusGatewayTimeout)
@@ -1800,49 +1781,6 @@ func (this *HostList) TestDoman(domain string) string {
 		}
 	}
 	return domain
-}
-
-func (this *HostList) Copy(dst io.WriteCloser, src io.ReadCloser) (written int64, err error) {
-	defer src.Close()
-	defer dst.Close()
-
-	if wt, ok := src.(io.WriterTo); ok {
-		return wt.WriteTo(dst)
-	}
-
-	if rt, ok := dst.(io.ReaderFrom); ok {
-		return rt.ReadFrom(src)
-	}
-
-	buf := this.mPool.Get().([]byte)
-	defer this.mPool.Put(buf)
-
-	for {
-		nr, er := src.Read(buf)
-		if 0 < nr {
-			nw, ew := dst.Write(buf[:nr])
-			if 0 < nw {
-				written += int64(nw)
-			}
-			if nil != ew {
-				err = ew
-				break
-			}
-			if nr != nw {
-				err = io.ErrShortWrite
-				break
-			}
-		}
-		if io.EOF == er {
-			break
-		}
-		if nil != er {
-			err = er
-			break
-		}
-	}
-
-	return written, err
 }
 
 func (this *HostList) HttpError(w io.Writer, code int) {
