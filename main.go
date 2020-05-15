@@ -97,6 +97,8 @@ type HTTPSRule struct {
 
 	AutoCert bool
 
+	Redirect bool
+
 	Target string
 
 	Suffix string
@@ -535,9 +537,14 @@ func (this *HostList) AddHTTPS(domain, target string) bool {
 				return false
 			}
 		}
-		if nil != this.mRegexpIPPort {
-			if !this.mRegexpIPPort.MatchString(target) {
-				return false
+		//
+		autocert := strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://")
+		//
+		if !autocert {
+			if nil != this.mRegexpIPPort {
+				if !this.mRegexpIPPort.MatchString(target) {
+					return false
+				}
 			}
 		}
 		if '.' == domain[0] {
@@ -558,6 +565,9 @@ func (this *HostList) AddHTTPS(domain, target string) bool {
 		if _, ok := this.mListHTTPS[domain]; !ok {
 			this.mListHTTPS[domain] = &HTTPSRule{
 				Target: target,
+
+				AutoCert: autocert,
+				Redirect: autocert,
 			}
 			return true
 		}
@@ -848,8 +858,14 @@ func (this *HostList) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		} else if rule, _ := this.mListHTTPS[r.Host]; nil != rule {
 			if nil != rule.PluginHandler {
+				//
 				rule.PluginHandler(w, r)
 				// 退出
+				return
+			} else if rule.Redirect {
+				//
+				this.HttpRedirect(w, rule.Target)
+				//
 				return
 			} else if rule.AutoCert {
 				if !this.IsAuthLogin(w, r, r.Host, rule) {
@@ -1059,6 +1075,7 @@ func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
 				fmt.Fprint(w, `<th class="domain">域名</th>`)
 				fmt.Fprint(w, `<th class="green">插件</th>`)
 				fmt.Fprint(w, `<th class="green">自动证书</th>`)
+				fmt.Fprint(w, `<th class="green">跳转</th>`)
 				fmt.Fprint(w, `<th class="red">目标</th>`)
 				fmt.Fprint(w, `<th class="red">密钥</th>`)
 				fmt.Fprint(w, `</tr>`)
@@ -1080,6 +1097,7 @@ func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
 							fmt.Fprintf(w, `<td>%s</td>`, item)
 							fmt.Fprintf(w, `<td>%v</td>`, nil != rule.PluginHandler)
 							fmt.Fprintf(w, `<td>%v</td>`, rule.AutoCert)
+							fmt.Fprintf(w, `<td>%v</td>`, rule.Redirect)
 							fmt.Fprintf(w, `<td>%s</td>`, rule.Target)
 							//
 							if "" != rule.AuthBase64 {
