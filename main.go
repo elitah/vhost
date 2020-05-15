@@ -3,6 +3,7 @@ package main
 import (
 	"container/list"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -171,6 +172,7 @@ type HostList struct {
 
 	mGlobalCertFilepath string
 	mGlobalKeyFilepath  string
+	mGlobalCAFilepath  string
 
 	mAuthCode map[string]*AuthNode
 }
@@ -256,6 +258,7 @@ func (this *HostList) LoadConfig(path string) bool {
 				ReCAPTCHAVerify    string           `json:"recaptcha_verify"`
 				GlobalCertFilepath string           `json:"global_cert_filepath"`
 				GlobalKeyFilepath  string           `json:"global_key_filepath"`
+				GlobalCAFilepath  string           `json:"global_ca_filepath"`
 				Domain             string           `json:"domain"`
 				Username           string           `json:"username"`
 				Password           string           `json:"password"`
@@ -287,6 +290,7 @@ func (this *HostList) LoadConfig(path string) bool {
 				if "" != list.GlobalCertFilepath && "" != list.GlobalKeyFilepath {
 					this.mGlobalCertFilepath = list.GlobalCertFilepath
 					this.mGlobalKeyFilepath = list.GlobalKeyFilepath
+					this.mGlobalCAFilepath = list.GlobalCAFilepath
 				}
 				if "" != list.Domain {
 					if nil != this.mRegexpDomain && this.mRegexpDomain.MatchString(list.Domain) {
@@ -770,13 +774,37 @@ func (this *HostList) TLSConfig() *tls.Config {
 		} else {
 			this.mGlobalKeyFilepath = filepath.Join(rootDir, filepath.Base(this.mGlobalKeyFilepath))
 		}
+		if f, err := os.Open(this.mGlobalCAFilepath); nil == err {
+			if path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd())); nil == err {
+				this.mGlobalCAFilepath = path
+			}
+			f.Close()
+		} else {
+			this.mGlobalCAFilepath = filepath.Join(rootDir, filepath.Base(this.mGlobalCAFilepath))
+		}
 		//
 		logs.Info(this.mGlobalCertFilepath)
 		logs.Info(this.mGlobalKeyFilepath)
+		logs.Info(this.mGlobalCAFilepath)
 		//
 		if certPem, err := ioutil.ReadFile(this.mGlobalCertFilepath); nil == err {
 			if keyPem, err := ioutil.ReadFile(this.mGlobalKeyFilepath); nil == err {
 				if cert, err := tls.X509KeyPair(certPem, keyPem); nil == err {
+					//
+					if caPem, err := ioutil.ReadFile(this.mGlobalCAFilepath); nil == err {
+						//
+						pool := x509.NewCertPool()
+						//
+						pool.AppendCertsFromPEM(caPem)
+						//
+						return &tls.Config{
+							Certificates: []tls.Certificate{cert},
+
+							ClientCAs:  pool,
+							ClientAuth: tls.RequireAndVerifyClientCert,
+						}
+					}
+					//
 					return &tls.Config{
 						Certificates: []tls.Certificate{cert},
 					}
