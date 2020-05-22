@@ -174,7 +174,7 @@ type HostList struct {
 
 	mGlobalCertFilepath string
 	mGlobalKeyFilepath  string
-	mGlobalCAFilepath  string
+	mGlobalCAFilepath   string
 
 	mAuthCode map[string]*AuthNode
 }
@@ -260,7 +260,7 @@ func (this *HostList) LoadConfig(path string) bool {
 				ReCAPTCHAVerify    string           `json:"recaptcha_verify"`
 				GlobalCertFilepath string           `json:"global_cert_filepath"`
 				GlobalKeyFilepath  string           `json:"global_key_filepath"`
-				GlobalCAFilepath  string           `json:"global_ca_filepath"`
+				GlobalCAFilepath   string           `json:"global_ca_filepath"`
 				Domain             string           `json:"domain"`
 				Username           string           `json:"username"`
 				Password           string           `json:"password"`
@@ -1349,7 +1349,11 @@ func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
 						if "" != this.mReCAPTCHA {
 							fmt.Fprintf(w, `<script src="https://recaptcha.net/recaptcha/api.js?render=%s"></script>
 		<script>
-		grecaptcha.ready(function() {
+		function grecaptcha_execute () {
+			try {
+				grecaptcha.reset();
+			} catch(e) {
+			}
 			grecaptcha.execute('%s', {action: 'homepage'}).then(function(token) {
 				var btn = document.getElementById("submit");
 				if (btn) {
@@ -1358,15 +1362,24 @@ func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
 				}
 				document.getElementById("recaptcha").value = token;
 			});
-		});
+		}
+		window.onload = function () {
+			grecaptcha.ready(function() {
+				grecaptcha_execute();
+
+				setInterval(grecaptcha_execute, 30000);
+			});
+		}
 		</script>
 `, this.mReCAPTCHA, this.mReCAPTCHA)
 						} else {
 							fmt.Fprintf(w, `<script>
-		var btn = document.getElementById("submit");
-		if (btn) {
-			btn.disabled = "";
-			btn.value = "登陆";
+		window.onload = function () {
+			var btn = document.getElementById("submit");
+			if (btn) {
+				btn.disabled = "";
+				btn.value = "登陆";
+			}
 		}
 		</script>
 	`)
