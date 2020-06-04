@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"container/list"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"io"
 	"io/ioutil"
 	"net"
@@ -1276,7 +1278,8 @@ func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
 						code = r.FormValue("code")
 					}
 					if this.MasterDomain == u.Host || this.CheckAuthCode(code) {
-						for i := 0; 1 > i; i++ {
+						switch {
+						default:
 							if this.MasterDomain == r.Host {
 								break
 							}
@@ -1289,6 +1292,36 @@ func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
 							this.HttpRedirect(w, redirect)
 							return
 						}
+						// 加载模板
+						if data, err := ioutil.ReadFile(filepath.Join(rootDir, "login.tpl")); nil == err {
+							if t, err := template.New("login").Parse(string(data)); nil == err {
+								//
+								var b bytes.Buffer
+								//
+								if err := t.Execute(&b, struct {
+									Code      string
+									Redirect  string
+									ReCAPTCHA string
+								}{
+									Code:      code,
+									Redirect:  redirect,
+									ReCAPTCHA: this.mReCAPTCHA,
+								}); nil == err {
+									//
+									w.Header().Set("Content-Type", "text/html")
+									//
+									w.Write(b.Bytes())
+									return
+								} else {
+									logs.Warn(err)
+								}
+							} else {
+								logs.Warn(err)
+							}
+						} else {
+							logs.Warn(err)
+						}
+						//
 						fmt.Fprintf(w, `<html>
 	<head>
 		<meta charset="UTF-8">
@@ -1428,6 +1461,104 @@ func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
 			// 跳转地址
 			var redirectCode string
 			var redirectURL string
+			//
+			if "application/json" == r.Header.Get("Content-Type") {
+				//
+				w.Header().Set("Content-Type", "application/json")
+				//
+				if data, err := ioutil.ReadAll(r.Body); nil == err {
+					result := &struct {
+						Username string `json:"username"`
+						Password string `json:"password"`
+						Code     string `json:"code"`
+						Redirect string `json:"redirect"`
+						Token    string `json:"token"`
+					}{}
+					//
+					if err := json.Unmarshal(data, result); nil == err {
+						if this.VerifyReCAPTCHA(result.Token, r) {
+							if u, err := url.Parse(result.Redirect); nil == err {
+								if this.MasterDomain == u.Host || "" != result.Code {
+									var validKey string
+									//
+									if this.MasterDomain == u.Host {
+										validKey = this.mHttpAuth
+									} else if rule := this.mListHTTPS[u.Host]; nil != rule {
+										validKey = rule.AuthBase64
+									}
+									if "" != validKey {
+										//
+										if "" != result.Username {
+											if "" != result.Password {
+												_result := base64.StdEncoding.EncodeToString(
+													[]byte(fmt.Sprintf(
+														"%s:%s",
+														result.Username,
+														result.Password,
+													)),
+												)
+												if _result == validKey {
+													if this.MasterDomain == u.Host {
+														http.SetCookie(w, &http.Cookie{
+															Name:     "__auth_token__",
+															Value:    hash.HashToString("sha1", validKey, this.mCookieSID),
+															MaxAge:   this.mCookieValidity,
+															HttpOnly: true,
+														})
+													} else {
+														//激活令牌
+														this.SetAuthCodeConfirm(result.Code)
+													}
+													//
+													fmt.Fprintf(w, `{"status":true}`)
+													//返回
+													return
+												} else {
+													logs.Error("%s:%s => %s => %s", result.Username, result.Password, _result, validKey)
+												}
+											} else {
+												logs.Error("no password")
+											}
+										} else {
+											logs.Error("no username")
+										}
+										// 用户名或密码错误
+										errno = 4
+									} else {
+										// 找不到对象
+										errno = 3
+									}
+								} else {
+									// 参数错误
+									errno = 2
+								}
+							} else {
+								// 参数错误
+								errno = 2
+
+								logs.Error(err)
+							}
+						} else {
+							// 机器
+							errno = 1
+						}
+					} else {
+						// 参数错误
+						errno = 2
+
+						logs.Error(err)
+					}
+				} else {
+					// 参数错误
+					errno = 2
+
+					logs.Error(err)
+				}
+				//
+				fmt.Fprintf(w, `{"status":false,"errno":%d}`, errno)
+				//
+				return
+			}
 			// 机器识别
 			if !this.VerifyReCAPTCHA(r.FormValue("recaptcha"), r) {
 				// 恶意用户
