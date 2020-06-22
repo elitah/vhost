@@ -886,6 +886,7 @@ func (this *HostList) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 											Value: hash.HashToString("sha1", rule.AuthBase64,
 												timeunix,
 												this.mCookieSID),
+											Path:     "/",
 											MaxAge:   this.mCookieValidity,
 											HttpOnly: true,
 										})
@@ -1502,6 +1503,7 @@ func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
 														http.SetCookie(w, &http.Cookie{
 															Name:     "__auth_token__",
 															Value:    hash.HashToString("sha1", validKey, this.mCookieSID),
+															Path:     "/",
 															MaxAge:   this.mCookieValidity,
 															HttpOnly: true,
 														})
@@ -1589,6 +1591,7 @@ func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
 												http.SetCookie(w, &http.Cookie{
 													Name:     "__auth_token__",
 													Value:    hash.HashToString("sha1", validKey, this.mCookieSID),
+													Path:     "/",
 													MaxAge:   this.mCookieValidity,
 													HttpOnly: true,
 												})
