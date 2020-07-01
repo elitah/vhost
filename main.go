@@ -997,6 +997,10 @@ func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
 				fmt.Fprint(w, `</head>`)
 				fmt.Fprint(w, `<body>`)
 
+				fmt.Fprint(w, `<div>`)
+				fmt.Fprintf(w, `<p><a href="/service_reload?_t=%d">重启服务</a></p>`, time.Now().UnixNano())
+				fmt.Fprint(w, `</div>`)
+
 				this.RLock()
 
 				fmt.Fprint(w, `<p>最近访问的域名列表: <select>`)
@@ -1166,6 +1170,31 @@ func (this *HostList) ServeMaster(w http.ResponseWriter, r *http.Request) {
 				fmt.Fprint(w, `</body>`)
 				fmt.Fprint(w, `</html>`)
 			}
+		} else {
+			//
+			v := url.Values{}
+			//
+			v.Add("redirect", fmt.Sprintf("https://%s%s", r.Host, r.URL.RequestURI()))
+			//
+			u := url.URL{
+				Scheme:   "https",
+				Host:     r.Host,
+				Path:     "/login",
+				RawQuery: v.Encode(),
+			}
+			//
+			this.HttpRedirect(w, u.String())
+		}
+		return
+	case "/service_reload":
+		if this.CheckHTTPAuth(w, r) {
+			go func() {
+				// 发信息退出进程
+				if p, err := os.FindProcess(os.Getpid()); nil == err {
+					time.Sleep(500 * time.Millisecond)
+					p.Signal(syscall.SIGTERM)
+				}
+			}()
 		} else {
 			//
 			v := url.Values{}
